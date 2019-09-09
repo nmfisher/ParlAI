@@ -29,7 +29,7 @@ class EncoderRNN(nn.Module):
         self.embedder = DistilBertModel.from_pretrained('distilbert-base-uncased')
 
         self.gru = nn.GRU(
-            hidden_size, hidden_size, num_layers=numlayers, batch_first=True
+            input_size, hidden_size, num_layers=numlayers, batch_first=True
         )
 
     def forward(self, input, hidden=None):
@@ -38,14 +38,16 @@ class EncoderRNN(nn.Module):
         :param input: (batchsize x seqlen x embedding_dim) tensor of token indices.
         :param hidden: optional past hidden state
         """
-        input = self.embedder(input)[0]
+        print("INPUT SIZE")
+        print(input.size())
+        input = self.embedder(torch.squeeze(input))[0]
         output, hidden = self.gru(input, hidden)
         return output, hidden
 
 class FF(nn.Module):
     """Encodes the input context."""
 
-    def __init__(self, input_size, hidden_size, numlayers, numcandidates):
+    def __init__(self, hidden_size, embeddingsize, numcandidates):
         """Initialize encoder.
 
         :param input_size: size of embedding
@@ -53,13 +55,14 @@ class FF(nn.Module):
         :param numlayers: number of GRU layers
         """
         super().__init__()
+        self.input_size = (numcandidates + 1) * embeddingsize
         self.hidden_size = hidden_size
 
         self.dense = nn.Linear(
-            hidden_size, hidden_size,
+            self.input_size, hidden_size,
         )
         self.activation = nn.ReLU()
-        self.linear = nn.Linear(hidden_size, numcandidates)
+        self.linear = nn.Linear(hidden_size, embeddingsize)
 
     def forward(self, input, hidden=None):
         """Return encoded state.
@@ -68,10 +71,14 @@ class FF(nn.Module):
         :param hidden: optional past hidden state
         """
         # use the last sequence output as the input
-#        print("Using last sequence output")
         print(input.size())
-        linear = self.dense(input[:,-1])
-        output = self.linear()(self.activation()(self.dense()(input[:,-1])))
+        output = self.linear()(
+          self.activation()(
+            self.dense()(
+              input
+            )
+          )
+        )
         return output, hidden
 
 class ResponseSelection2Agent(TorchAgent):
@@ -97,7 +104,7 @@ class ResponseSelection2Agent(TorchAgent):
             '-esz',
             '--embeddingsize',
             type=int,
-            default=128,
+            default=768,
             help='size of the token embeddings',
         )
         agent.add_argument(
@@ -114,6 +121,9 @@ class ResponseSelection2Agent(TorchAgent):
         )
         agent.add_argument(
             '--gpu', type=int, default=-1, help='which GPU device to use'
+        )
+        agent.add_argument(
+            '-msl', '--maxseqlen', type=int, default=20, help='maximum sequence length'
         )
         agent.add_argument(
             '-rf',
@@ -145,7 +155,7 @@ class ResponseSelection2Agent(TorchAgent):
             self.encoder = EncoderRNN(esz, hsz, nl)
             self.model = self.encoder
             # FF1 converts batch_size * embedding_dim to batch_size * num_candidates
-            self.ff1 = FF(esz, hsz, nl, nc)
+            self.ff1 = FF(hsz, esz, nc)
 
             if self.use_cuda:  # set in parent class
                 self.encoder.cuda()
@@ -158,7 +168,7 @@ class ResponseSelection2Agent(TorchAgent):
             self.encoder = shared['encoder']
 
         # set up the criterion
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.MSELoss()
 
         # set up optims for each module
         lr = opt['learningrate']
@@ -170,6 +180,8 @@ class ResponseSelection2Agent(TorchAgent):
         self.hiddensize = opt['hiddensize']
         self.numlayers = opt['numlayers']
         self.numcandidates = opt['numcandidates']
+        self.embeddingsize = opt['embeddingsize']
+        self.maxseqlen = opt['maxseqlen']
         self.START = torch.LongTensor([self.START_IDX])
         if self.use_cuda:
             self.START = self.START.cuda()
@@ -192,7 +204,6 @@ class ResponseSelection2Agent(TorchAgent):
         Set the 'text_vec' field in the observation.
         Useful to override to change vectorization behavior
         """
-
         obs["text_vec"] = self._vectorize(obs["text"])
         return obs
 
@@ -248,6 +259,19 @@ class ResponseSelection2Agent(TorchAgent):
         kwargs['add_start'] = False
         return super().vectorize(*args, **kwargs)
 
+    def _extract_and_tokenize(self, candidates, correct):
+      candidates_toks = []
+      for j in range(self.numcandidates - 1):
+        candidate = None
+        while candidate is None or candidate in candidates or candidate == correct:
+          candidate = random.choice(candidates)
+        candidate_toks = self.tokenizer.tokenize(candidate)
+        candidates_toks.append(candidate_toks)
+      # add the correct candidate as the last entry
+      correct_toks = self.tokenizer.tokenize(correct)
+      candidates_toks.append(correct_toks)
+      return candidates_toks
+
     def train_step(self, batch):
         """Train model to produce ys given xs.
 
@@ -263,46 +287,68 @@ class ResponseSelection2Agent(TorchAgent):
             return
 
         bsz = xs.size(0)
-        ys = []
 
-        batched_candidates = []
+        # xs are the tokenized utterances
+        xs = torch.unsqueeze(xs, 1) # transform to bsz x 1 x seqlen
+        # now encode and take the last output
+        xs = self.encoder(xs)[0]
+        print(xs.size())
+        print(batch.observations)
+        xs = xs[:,-1] 
+
+        # inputs will be the embedded utterances + candidate responses
+        inputs = torch.zeros([bsz, self.numcandidates+1, self.embeddingsize])
+        # add the encoded utterance as the first entry
+        inputs[:,0] = xs
+
+        # ys will be the correct (embedded) candidate responses
+        ys = torch.zeros([bsz, 1, self.embeddingsize])
+
+        # we construct ys by tokenizing (numcandidate) candidates 
+        # then feeding the entire (batch-wide) tensor into the encoder
+        # first, we need the max seqlen across the batch to construct the tensor
+#        max_seq_len = max([max(batch.observations[i]["label_lengths"]) for i in range(bsz)])
+        max_seq_len = self.maxseqlen
+        # candidates_toks will hold the tokenized candidates
+        candidates_toks = torch.zeros([bsz, self.numcandidates, max_seq_len])
         for i in range(bsz):
-          actual = batch.observations[i]["labels"][0]
-          candidates = [actual]
-          for j in range(self.numcandidates - 1):
-            candidate = None
-            while candidate is None or candidate in candidates:
-                candidate = random.choice(batch.observations[0]["label_candidates"])
-            candidates.append(candidate)
-            random.shuffle(candidates)
-          y_true = torch.LongTensor([candidates.index(actual)])
-          #        y_true = F.one_hot(actual_index, self.numcandidates)
-          ys.append(y_true)
-          batched_candidates.append(candidates)
+          obs = batch.observations[i]
+          correct_text = obs["labels"][0]
+          candidates_toks[i,:] = self._extract_and_tokenize(obs["label_candidates"], obs["label"]) # returns 1 x numcandidates x seqlen
+        candidates_encoded = self.encoder(candidates_toks)[0]
+        print("CANDIADTES_CENCODED")
+        print(candidates_encoded)
+        candidates_encoded = candidates_encoded[:,-1] # bsz x numcandidates x esz
 
-        ys = torch.LongTensor(ys)
+        for i in range(bsz):
+          idx = random.randint(self.numcandidates) # shuffle the correct candidates
+          y = candidates_encoded[i,-1]
+          candidates_encoded[i,-1] = candidates_encoded[i,idx]
+          candidates_encoded[i,idx] = y
+          ys[i] = torch.unsqueeze(y)
+
+        # now concat the encoded candidates to the encoded utterance
+        inputs[:,1:] = candidates_encoded
+        inputs = torch.unbind(inputs, 1) # gives a list of numcandidates + 1 [bsz x esz]
+        inputs = torch.cat(inputs,1) # [bsz x esz * (numcandidates + 1)]
+
         if self.use_cuda:  # set in parent class
           ys = ys.cuda()
+          inputs.cuda()
 
-        starts = self.START.expand(bsz, 1)  # expand to batch size
         loss = 0
         self.zero_grad()
         self.encoder.train()
 
-        _encoder_output, encoder_hidden = self.encoder(xs)
+        # Feed the concatenated inputs to the input to the FF network
+        # the output will be trained to minimize MSE against the correct candidate vector
+        ff_output = self.ff1(inputs)
 
-        # Teacher forcing: Feed the target as the next input
-        ff_output, _ = self.ff1(_encoder_output)
-
-        _, output_indices = torch.max(ff_output,1)
-        #print("XS")
-        #print(xs.size())
-        #print("OUTPUT")
-        #print(ff_output.size())
-        #print("YS")
-        #print(y_true.size())
-        scores = ff_output.view(-1, ff_output.size(-1))
-        loss = self.criterion(scores, ys)
+        # the output wil
+        print("FF_OUTPUT")
+        print(ff_output.size())
+        print(ys.size())
+        loss = self.criterion(ff_output, ys)
         loss.backward()
         self.update_params()
 #        print(output_indices)
