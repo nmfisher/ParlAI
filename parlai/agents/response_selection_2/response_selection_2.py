@@ -54,14 +54,14 @@ class FF(nn.Module):
         :param numlayers: number of GRU layers
         """
         super().__init__()
-        self.input_size = (numcandidates + 1) * embeddingsize
+        self.input_size = 2 * embeddingsize
         self.hidden_size = hidden_size
 
         self.dense = nn.Linear(
             self.input_size, hidden_size,
         )
         self.activation = nn.ReLU()
-        self.linear = nn.Linear(hidden_size, embeddingsize)
+        self.linear = nn.Linear(hidden_size, 2)
 
     def forward(self, input):
         """Return encoded state.
@@ -86,6 +86,38 @@ class ResponseSelection2Agent(TorchAgent):
     <http://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html>`_.
     """
 
+    def save(self, path=None):
+      print("Saving!")
+      super().save(path)
+
+    def state_dict(self):
+        """
+        Get the state dict for saving.
+        Override this method for more specific saving.
+        """
+        states = {}
+        states['encoder'] = self.encoder.state_dict()
+        states['ff'] = self.ff1.state_dict()
+
+        if hasattr(self, 'optimizer'):
+            # save optimizer params
+            states['optimizer'] = self.optimizer.state_dict()
+            states['optimizer_type'] = self.opt['optimizer']
+
+        # lr scheduler
+        if torch.__version__.startswith('0.'):
+            warn_once(
+                "Must upgrade to Pytorch 1.0 to save the state of your " "LR scheduler."
+            )
+        else:
+            states['number_training_updates'] = self._number_training_updates
+            if getattr(self, 'scheduler', None):
+                states['lr_scheduler'] = self.scheduler.state_dict()
+                states['lr_scheduler_type'] = self.opt['lr_scheduler']
+            if getattr(self, 'warmup_scheduler', None):
+                states['warmup_scheduler'] = self.warmup_scheduler.state_dict()
+
+        return states
     @classmethod
     def add_cmdline_args(cls, argparser):
         """Add command-line arguments specifically for this agent."""
@@ -166,7 +198,7 @@ class ResponseSelection2Agent(TorchAgent):
             self.encoder = shared['encoder']
 
         # set up the criterion
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.CrossEntropyLoss()
 
         # set up optims for each module
         lr = opt['learningrate']
@@ -187,6 +219,8 @@ class ResponseSelection2Agent(TorchAgent):
         self.reset()
   
         self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+
+        self.agg_loss = 0
 
     def _vectorize(self, text):
         tokens = self.tokenizer.encode(text)
@@ -227,6 +261,13 @@ class ResponseSelection2Agent(TorchAgent):
       
         return shared
 
+    def report(self):
+      print(self.metrics)
+      metrics = super().report()
+      metrics['loss'] = self.agg_loss.item()
+      self.agg_loss = 0
+      return metrics
+
     def v2t(self, vector):
         """Convert vector to text.
 
@@ -255,19 +296,20 @@ class ResponseSelection2Agent(TorchAgent):
 
     def _extract_and_tokenize(self, candidates, correct):
       candidates_toks = []
+      selected = []
       for j in range(self.numcandidates - 1):
         candidate = None
-        seen = []
-        while candidate is None or candidate in seen or candidate == correct:
+        while candidate is None or candidate in selected or candidate == correct:
           candidate = random.choice(candidates)
-        seen.append(candidate)
+        selected.append(candidate)
         candidate_toks = self.tokenizer.encode(candidate)
         candidates_toks.append(candidate_toks)
       # add the correct candidate as the last entry
       correct_toks = self.tokenizer.encode(correct)
       candidates_toks.append(correct_toks)
       candidates_toks = padded_tensor(candidates_toks)[0]
-      return candidates_toks
+      selected.append(correct)
+      return candidates_toks, selected
 
     def train_step(self, batch):
         """Train model to produce ys given xs.
@@ -289,47 +331,34 @@ class ResponseSelection2Agent(TorchAgent):
         xs = torch.unsqueeze(xs, 1) # transform to bsz x 1 x seqlen
         # now encode and take the last RNN output
         xs = self.encoder(xs)[0]
-        xs = xs[:,-1] 
+        xs = xs[:,-1] # bsz x esz
+        xs = torch.unsqueeze(xs, 1) # bsz x 1 x esz, so we can tile on dim1 later
+        
+        inputs = torch.zeros([bsz, self.numcandidates, self.embeddingsize * 2])
 
-        # inputs will be the embedded utterances + candidate responses
-        inputs = torch.zeros([bsz, self.numcandidates+1, self.embeddingsize])
-        # add the encoded utterance as the first entry
-        inputs[:,0] = xs
+        candidates = []
 
-        # we first encode the correct candidate response and (numcandidate-1) incorrect candidates
-        candidates_encoded = torch.zeros([bsz, self.numcandidates, self.embeddingsize])
         for i in range(bsz):
           obs = batch.observations[i]
-          toks = self._extract_and_tokenize(obs["label_candidates"], obs["labels"][0]) # returns numcandidates x seqlen
+          # tokenize/embed the responses
+          toks, selected = self._extract_and_tokenize(obs["label_candidates"], obs["labels"][0]) # returns numcandidates x seqlen
+          candidates.append(selected)
           encoded = self.encoder(toks.cuda())[0]
-          print("encoded pre slice")
-          print(encoded.size()) # should be numcandidates x seqlen x esz
-          encoded = encoded[:,-1] # should be numcandidates x 1 x esz
-          print("encoded post slice")
-          print(encoded.size())
-          candidates_encoded[i] = encoded
+          encoded = torch.squeeze(encoded[:,-1], 1) # should be numcandidates x 1 x esz
+          
+          # tile the utterance to numcandidates
+          # xs[i] is 1 x esz
+          x = xs[i].expand(self.numcandidates, self.embeddingsize) # convert esz to (numcandidates x esz
+          encoded = torch.cat([x, encoded], 1) # numcandidates x esz
+          inputs[i] = encoded
 
         # ys will be the correct (embedded) candidate responses
-        ys = torch.zeros([bsz, self.embeddingsize])
+        ys = [0] * (self.numcandidates - 1)
+        ys += [1]
+        ys = [ys] * bsz
+        ys = torch.LongTensor(ys)
+        
 
-        indices = []
-        for i in range(bsz):
-          y = candidates_encoded[i,-1]
-          idx = random.randint(0, self.numcandidates - 1) # shuffle the correct candidates
-          candidates_encoded[i,-1] = candidates_encoded[i,idx]
-          candidates_encoded[i,idx] = y
-          ys[i] = y #torch.unsqueeze(y, 1)
-          indices.append(idx)
-
-        # now concat the encoded candidates to the encoded utterance
-        inputs[:,1:] = candidates_encoded
-        inputs = torch.unbind(inputs, 1) # gives a list of numcandidates + 1 [bsz x esz]
-        #assert len(inputs) == self.numcandidates + 1
-        #print("first input size")
-        #print(inputs[0].size())
-        inputs = torch.cat(inputs,1) # [bsz x esz * (numcandidates + 1)]
-        #print("inputs size")
-        #print(inputs.size())
         if self.use_cuda:  # set in parent class
           ys = ys.cuda()
           inputs.cuda()
@@ -341,38 +370,37 @@ class ResponseSelection2Agent(TorchAgent):
         # Feed the concatenated inputs to the input to the FF network
         # the output will be trained to minimize MSE against the correct candidate vector
         ff_output = self.ff1(inputs.cuda())
-        print(ff_output)
-#        ff_output = torch.squeeze(ff_output, 1)
-        ff_output = torch.unsqueeze(ff_output, 1)
-        # the output will
-        loss = self.criterion(ff_output, torch.unsqueeze(ys, 1))
+        # CrossEntropyLoss expects bsz x num_classes x ...., to transpose
+        ff_output = torch.transpose(ff_output, 1, 2)
+        #print("ys")
+        #print(ys.size())
+        #print(ys)
+        loss = self.criterion(ff_output, ys)
+        self.agg_loss += loss
         loss.backward()
         self.update_params()
 
         preds = []
         #print("ff_output")
-        #print(ff_output.size())
-        #print("candidates_encoded")
-        candidates_encoded = torch.transpose(candidates_encoded.cuda(), 1, 2)
-        #print(candidates_encoded.size())
-        
-        res = torch.matmul(ff_output, candidates_encoded)
-        mins = torch.argmin(res, 2)
-        print("mins")
-        print(mins)
-        #print(mins.size())
+        #print(ff_output.size()) # should be bsz x numcandidates x 2
+        #print(ff_output)
         pred_text = []
 
         for i in range(bsz):
-          idx = mins[i]
-          candidates = batch.observations[i]["label_candidates"]
-          #print("label_candidates len")
-          #print(len(candidates))
-          prediction = candidates[idx]
-          #print(prediction)
-          print("###### utterance: " + batch.observations[i]["text"])
-          print("####### correct response: " + batch.observations[i]["labels"][0])
-          print("######### predicted response: " + prediction)
+          #print("logits")
+          #print(ff_output[i])  # is numcandidates x 2
+          pred_idx = torch.max(ff_output[i], 0)[0] # to get max logit per candidate
+          print("pred_idx1")
+          print(pred_idx.size())
+          pred_idx = torch.max(pred_idx, 0)[1].item() # to get max candidate index per utterance
+          #print("pred_idx")
+          #print(pred_idx)
+          prediction = candidates[i][pred_idx]
+
+        #  print("###### utterance: " + batch.observations[i]["text"])
+        #  print("####### correct response: " + batch.observations[i]["labels"][0])
+        #  print("######### predicted response: " + prediction)
+        #  print("########## predicted index: " + str(pred_idx))
           pred_text.append(prediction)
          #        print(pred_text)
         return Output(pred_text)
