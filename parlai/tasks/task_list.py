@@ -965,4 +965,11 @@ task_list = [
             "  - [deepmoji_cand]: vector encoding from deepmoji penultimate layer for label line (candidate) - or None "
         ),
     },
+    {
+      "id":"ResponseSelection",
+      "display_name":"Response Selection",
+      "task":"response_selection",
+      "tags":["All"],
+      "description": "Train a model on PersonaChat to predict the correct response to a given utterance"
+    }
 ]
