@@ -18,14 +18,14 @@ import torch.nn.functional as F
 class AttentionFF(nn.Module):
     """Encodes the input context."""
 
-    def __init__(self, hidden_size, numlayers, vocab_size):
+    def __init__(self, hidden_size, numlayers, tokenizer):
         """Initialize encoder.
         :param hidden_size: size of GRU hidden layers
         :param numlayers: number of GRU layers
         """
         super().__init__()
 
-
+        self.tokenizer = tokenizer
         self.hidden_size = hidden_size
 
         self.numlayers = numlayers
@@ -36,21 +36,21 @@ class AttentionFF(nn.Module):
         self.dense = []
         self.activation = []
 
-        self.lstm = torch.nn.LSTM(768, 768, 1)
+#        self.lstm = torch.nn.LSTM(768, 768, 1)
 
         for i in range(numlayers):
           self.attn.append(nn.MultiheadAttention(
-              768, 2
+             768, 2, dropout=0.5
           ).cuda())
         
-          self.key.append(nn.Linear(768, hidden_size).cuda())
-          self.value.append(nn.Linear(768, hidden_size).cuda())
+          self.key.append(nn.Linear(768, 768).cuda())
+          self.value.append(nn.Linear(768, 768).cuda())
   
           self.dense.append(nn.Linear(
               768, hidden_size,
           ).cuda())
           self.activation.append(nn.ReLU().cuda())
-        self.linear = nn.Linear(hidden_size, vocab_size).cuda()
+        self.linear = nn.Linear(hidden_size, tokenizer.vocab_size).cuda()
 
     def forward(self, input, hidden=None):
         """Return encoded state.
@@ -58,24 +58,34 @@ class AttentionFF(nn.Module):
         :param input: (batchsize x seqlen x embedding_dim) tensor of token indices.
         :param hidden: optional past hidden state
         """
-        embedded = self.embedder(input)[0]
-#        embedded = self.lstm(embedded)[0]
+        clone = input.clone().detach()
+        #for i in range(clone.size(0)):
+        #  idx1 = random.randint(0, clone.size(1) - 1)
+        #  idx2 = random.randint(0, clone.size(1) - 1)
+        #  t1 = clone[i][idx1] 
+        #  clone[i][idx1] = clone[i][idx2]
+        #  clone[i][idx2] = t1
+#          clone[i][idx] = self.tokenizer.mask_token_id
+
+        embedded = self.embedder(clone)[0]
+ #        embedded = self.lstm(embedded)[0]
 
 #        print("lstme")
 #        print(embedded.size())
 
 #        embedded = embedded[-1]
-        #for i in range(self.numlayers):
+        for i in range(self.numlayers):
           #print(str(i))
-        #  k = self.key[i](embedded)
-        #  v = self.value[i](embedded)
-        #  embedded = self.attn[i](embedded, k, v)[0]
-        #  embedded = self.activation[i](
-        #      self.dense[i](
-        #          embedded
-        #      )
-        #  )
-        
+          k = self.key[i](embedded)
+          v = self.value[i](embedded)
+          embedded = self.attn[i](embedded, k, v)[0]
+          embedded = self.activation[i](
+              self.dense[i](
+                  embedded
+              )
+          )
+  #      embedded += torch.normal(torch.zeros(embedded.size()), 0.05).cuda()
+      
         return self.linear(embedded)
 
 class AutoencoderAgent(TorchAgent):
@@ -167,7 +177,6 @@ class AutoencoderAgent(TorchAgent):
         """
         super().__init__(opt, shared)
 
-
         self.step = 0
 
         self.id = 'AutoencoderAgent'
@@ -180,7 +189,7 @@ class AutoencoderAgent(TorchAgent):
             nl = opt['numlayers']
             esz = opt['embeddingsize']
             nc = opt["numcandidates"]
-            self.model = AttentionFF(hsz, nl, self.tokenizer.vocab_size)
+            self.model = AttentionFF(hsz, nl, self.tokenizer)
 
             if self.use_cuda:  # set in parent class
                 self.model = self.model.cuda()
@@ -301,7 +310,10 @@ class AutoencoderAgent(TorchAgent):
         inputs = []
         max_seq_len = 0
         for i in range(bsz):
-          utterance = batch.observations[i]["labels"][0]
+          if "labels" in batch.observations[i]:
+            utterance = batch.observations[i]["labels"][0]
+          else:
+            utterance = batch.observations[i]["eval_labels"][0]
           c_t = self.tokenizer.encode(utterance)
           max_seq_len = max(max_seq_len, len(c_t))
           inputs.append(c_t)
@@ -320,7 +332,7 @@ class AutoencoderAgent(TorchAgent):
 #        print(indices.size())
         for i in range(indices.size(0)):
           tokens = self.tokenizer.convert_ids_to_tokens(indices[i].tolist())
-          pred_text.append(" ".join(tokens).replace("[PAD]","").strip())
+          pred_text.append(" ".join(tokens).replace("[PAD]","").replace(" ##","").strip())
 #        print("pred_text len : %d" % len(pred_text))
         return pred_text
 
@@ -377,14 +389,19 @@ class AutoencoderAgent(TorchAgent):
 
         Return predicted responses (list of strings of length batchsize).
         """
+        batch.observations[0].force_set("eval_labels", ["I like watch sport [PAD] [PAD] [PAD] [PAD]"])
         inputs = self._tokenize_observation(batch)
         print(inputs.size())
         self.model.eval()
-        output = self.model(inputs.cuda())
+        inputs = inputs.cuda()
+        output = self.model(inputs)
         #output = output[:,0,:]
         output = torch.transpose(output, 1, 2)
         pred_text = self._get_predictions(output)
-        print("Input: " + batch.observations[0]["labels"][0])
+        if "labels" in batch.observations[0]:
+          print("Input: " + batch.observations[0]["labels"][0])
+        else:
+          print("Input: " + batch.observations[0]["eval_labels"][0])
         print("Prediction: " + pred_text[0])
         return Output(pred_text)
 
